@@ -45,7 +45,8 @@ Status CreateMemmappedFileSystemFile(const string& filename, bool corrupted,
 
   // Create a proto with some fields.
   GraphDef graph_def;
-  graph_def.set_version(kTestGraphDefVersion);
+  graph_def.mutable_versions()->set_producer(kTestGraphDefVersion);
+  graph_def.mutable_versions()->set_min_consumer(kTestGraphDefVersion);
   TF_RETURN_IF_ERROR(writer.SaveProtobuf(graph_def, kProtoFileName));
 
   // Save a tensor after the proto to check that alignment works.
@@ -74,7 +75,8 @@ TEST(MemmappedFileSystemTest, SimpleTest) {
   GraphDef test_graph_def;
   TF_EXPECT_OK(
       ReadBinaryProto(&memmapped_env, kProtoFileName, &test_graph_def));
-  EXPECT_EQ(kTestGraphDefVersion, test_graph_def.version());
+  EXPECT_EQ(kTestGraphDefVersion, test_graph_def.versions().producer());
+  EXPECT_EQ(kTestGraphDefVersion, test_graph_def.versions().min_consumer());
   // Check that we can correctly get a tensor memory.
   std::unique_ptr<ReadOnlyMemoryRegion> memory_region;
   TF_ASSERT_OK(memmapped_env.NewReadOnlyMemoryRegionFromFile(kTensor2FileName,
@@ -90,6 +92,11 @@ TEST(MemmappedFileSystemTest, SimpleTest) {
   TF_ASSERT_OK(memmapped_env.GetFileSize(kTensor2FileName, &file_size));
   EXPECT_EQ(test_tensor.TotalBytes(), file_size);
 
+  // Check that Stat works.
+  FileStatistics stat;
+  TF_ASSERT_OK(memmapped_env.Stat(kTensor2FileName, &stat));
+  EXPECT_EQ(test_tensor.TotalBytes(), stat.length);
+
   // Check that if file not found correct error message returned.
   EXPECT_EQ(
       error::NOT_FOUND,
@@ -97,8 +104,9 @@ TEST(MemmappedFileSystemTest, SimpleTest) {
           .code());
 
   // Check FileExists.
-  EXPECT_TRUE(memmapped_env.FileExists(kTensor2FileName));
-  EXPECT_FALSE(memmapped_env.FileExists("bla-bla-bla"));
+  TF_EXPECT_OK(memmapped_env.FileExists(kTensor2FileName));
+  EXPECT_EQ(error::Code::NOT_FOUND,
+            memmapped_env.FileExists("bla-bla-bla").code());
 }
 
 TEST(MemmappedFileSystemTest, NotInitalized) {
@@ -131,14 +139,24 @@ TEST(MemmappedFileSystemTest, ProxyToDefault) {
   const string dir = testing::TmpDir();
   const string filename = io::JoinPath(dir, "test_file");
   // Check that we can create write and read ordinary file.
-  std::unique_ptr<WritableFile> writable_file;
-  TF_ASSERT_OK(memmapped_env.NewAppendableFile(filename, &writable_file));
+  std::unique_ptr<WritableFile> writable_file_temp;
+  TF_ASSERT_OK(memmapped_env.NewAppendableFile(filename, &writable_file_temp));
+  // Making sure to clean up after the test finishes.
+  const auto adh = [&memmapped_env, &filename](WritableFile* f) {
+      delete f;
+      TF_CHECK_OK(memmapped_env.DeleteFile(filename));
+  };
+  std::unique_ptr<WritableFile, decltype(adh)> writable_file(
+      writable_file_temp.release(), adh);
   const string test_string = "bla-bla-bla";
   TF_ASSERT_OK(writable_file->Append(test_string));
   TF_ASSERT_OK(writable_file->Close());
   uint64 file_length = 0;
   TF_EXPECT_OK(memmapped_env.GetFileSize(filename, &file_length));
   EXPECT_EQ(test_string.length(), file_length);
+  FileStatistics stat;
+  TF_EXPECT_OK(memmapped_env.Stat(filename, &stat));
+  EXPECT_EQ(test_string.length(), stat.length);
   std::unique_ptr<RandomAccessFile> random_access_file;
   TF_ASSERT_OK(
       memmapped_env.NewRandomAccessFile(filename, &random_access_file));
